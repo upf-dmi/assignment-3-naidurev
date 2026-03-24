@@ -1,6 +1,6 @@
 ---
-title: "my title"
-author: "Dummy Surname (dummy@mail.com)"
+title: "Assignment 3"
+author: "Revanth Ramesh Naidu (revanth.naidu01@estudiant.upf.edu)"
 date: "Last update: `r format(Sys.time(), '%d %B, %Y')`"      
 output:
   html_document:
@@ -9,8 +9,10 @@ output:
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 ```
+
+This practical continues our analysis of the dataset from the publication [**Proteomic and Metabolomic Characterization of COVID-19 Patient Sera**](https://www.sciencedirect.com/science/article/pii/S0092867420306279). We work with the training cohort (Supplementary Table 3), which contains proteomic profiles for 31 COVID-19 patients (13 Severe and 18 Non-severe), measured across 791 protein features. The goal of this assignment is to build and evaluate a machine learning classifier to distinguish Severe from Non-severe patients based on their proteomic profiles, identify the most important protein features driving the classification, and validate the model on an independent test cohort (Supplementary Table 4, 10 patients).
 
 # Exercise 1
 
@@ -26,7 +28,7 @@ Report the following performance metrics from cross-validation:
 
 How well does the Random Forest model separate non-Severe from Severe patients based on proteomic profiles?
 
-```{r}
+```{r, comment=""}
 # ==========================================
 # CHUNK 1: Data Import
 # ==========================================
@@ -272,23 +274,20 @@ plot(rf_fit, main = "Random Forest CV Performance (mtry tuning)")
 var_imp <- caret::varImp(rf_fit, scale = FALSE)
 plot(var_imp, top = 29, main = "Top 29 Most Important Proteins", xlab = "Mean Decrease in Accuracy")
 ```
-MAIN CLARIFICATION: In the paper the RF was trained both with proteins and metabolites. Yet task specifically said "based on proteomic data", so we excluded metabolites from the data. This can cause major differences in the models.
+> **Note:** In the paper the RF was trained both with proteins and metabolites. The task specifically said "based on proteomic data", so we excluded metabolites. This can cause major differences in the models.
 
+> **Caveats:**
+>
+> 1. We use different data cleaning and imputation than in the paper.
+> 2. We used median imputation rather than the methods used in the paper.
+> 3. We imputed and scaled in each data split rather than globally to prevent data leakage — the paper does not explicitly state this.
+> 4. We had to reduce certain RF parameters to keep the running time reasonable with our limit of 6 CPUs.
 
-Caveats:
-1. We use different data cleaning and imputation than in the paper.
-2. We used median imputation rather than the methods used in the paper.
-3. We imputed and scaled in each data split rather than globally to prevent data leakage, the paper does not explicitly state this.
-4. We had to reduce certain RF parameters to keep the running time reasonable with our limit of 6 CPUs.
+> **Results:**
+>
+> **Confusion Matrix:** Four false negatives and two false positives, against the one false positive in the paper. **Accuracy:** 0.8065 against 0.935 in the original paper — lower, but acceptable. **mTRY:** Rather smooth drop, meaning the model is not only relying on a few strong features but is actually learning a general pattern. **AUC/ROC:** AUC is 0.9103 against 0.957 in the original paper. Lower than the original but falls in the same relative range — meaning if we draw a random severe patient alongside a random non-severe, the model gives more "risk" to the severe patient 91% of the time. The ROC rises sharply, meaning as the decision threshold rises, sensitivity improves yet specificity does not drop significantly. The model can differentiate groups quite well by allocating risk correctly.
 
-Results:
-
-Confusion Matrix: four False negatives and two false positives against the one false positive on the paper.
-Accuracy: 0.8065 against the 0.935 of the original paper. Lower than the original, but acceptable as a score.
-mTRY: Rather smooth drop, this is good, means model is not only relying on a few strong features, but is actually learning a general pattern.
-AUC/ROC: AUC is 0.9103 against 0.957 of the original paper. Lower than the original, but falls in the same relative range. Basically means, if we draw a random severe patient with a random non-severe, the model will give more "risk" to the severe patient 91% of the times. ROC rises sharply, thats also good. It means that as the decision threshold rises, sensitivity improves, yet specificity does not drop significantly. Model can differentiate groups quite well by allocating risk correctly.
-
-Conclusion: The deviations from the original could very well be justified with differences in imputation, data split and lower parameters. With this in mind, all metrics of our model are relatively high. The model appears to more or less balance negative and positive predictions, does not seem to overfit nor underfit, while accuracy, sensitivity and somewhat specificity report accurate predictions. We have to keep in mind that N is low (31), so even small deviations can have a high impact on metrics.
+> **Conclusion:** The deviations from the original could be justified by differences in imputation, data splitting, and lower parameters. With this in mind, all metrics of our model are relatively high. The model appears to more or less balance negative and positive predictions, does not seem to overfit or underfit, while accuracy, sensitivity, and somewhat specificity report accurate predictions. We have to keep in mind that N is low (31), so even small deviations can have a high impact on metrics.
 
 
 # Exercise 2
@@ -299,7 +298,7 @@ Using the trained Random Forest model from Exercise 1, identify the 25 most impo
 
 Compare your selected features to the proteins reported by the authors in Supplementary Table 5.
 
-```{r}
+```{r, comment=""}
 # 1. Install required packages for direct mapping
 if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
 if (!requireNamespace("reactome.db", quietly = TRUE)) BiocManager::install("reactome.db", update = FALSE)
@@ -452,9 +451,9 @@ print(extra_in_ours)
 ```
 
 
-Biological interpretations: Most of our detected genes are involved in immune responses. This matches what we would expect given our case (COVID is an infection, which is nowadays also known to directly influence the immune system beyond a standard immune activation). We see a lot of protein control pathways (like metabolism and post-translational modification), this is also common during increased cell activity (like a viral infection, or for example, the immune system cleaning extra cellular debris). Similar to the study, we also see Platelet degranutalion among our top 25 proteins. Overall, our model seems to differentiate non-severe from severe based on the expression of proteins directly or indirectly related to immune response and cell state (Homeostasis), as well as wound response (Platelets). 
+> **Biological Interpretation:** Most of our detected genes are involved in immune responses. This matches what we would expect given our case — COVID is an infection which is known to directly influence the immune system beyond standard immune activation. We see a lot of protein control pathways (like metabolism and post-translational modification), which is also common during increased cell activity such as a viral infection or the immune system clearing extracellular debris. Similar to the study, we also see platelet degranulation among our top 25 proteins. Overall, our model seems to differentiate non-severe from severe based on the expression of proteins directly or indirectly related to immune response, cell state homeostasis, and wound response.
 
-Comparison to the study: Not very similar 6 out of 25 proteins match but the general pathways present seem more similar. Both models differentiate based on immune response proteins expression. Both models highlighted SERPINA family members, a family key in regulating cell homestasis and programmed death (a key defense mechanism in viral infections). Differences could be explained by several factors, but mostly: As mentioned before, we used different parameters for data cleaning and imputation. Moreover, our model was trained on Cohort 1 (C1), while their highlighted proteins in S5 were derived from C3 (if the ML is generalizable this shouldn't cause major deviations, but can explain differences.) Our RF was also kept less computationally intensive for the sake of running speed, which resulted in a slightly less accurate model even if acceptable. With this in mind, differences seem to be in the details rather than the overall signal. Both models splits based on immune response protein expression, both models largely splitted groups correctly, both models identified as the strongest features proteins involved in the same or similar/related pathways. Overall, we are confident this is just a difference in resolution and context, not a major shift from the original, even though our model was not trained with metabolites, only proteins.
+> **Comparison to the study:** Only 6 out of 25 proteins match, but the general pathways present seem more similar. Both models differentiate based on immune response protein expression. Both models highlighted SERPINA family members, a family key in regulating cell homeostasis and programmed cell death — a key defense mechanism in viral infections. Differences could be explained by several factors: different parameters for data cleaning and imputation; our model was trained on Cohort 1 (C1) while their highlighted proteins in S5 were derived from C3; and our RF was kept less computationally intensive for speed, resulting in a slightly less accurate model. With this in mind, differences seem to be in the details rather than the overall signal — both models split based on immune response protein expression, both largely classified groups correctly, and both identified as the strongest features proteins involved in the same or similar pathways. We are confident this is a difference in resolution and context, not a major shift from the original.
 
 
 # Exercise 3
@@ -473,7 +472,9 @@ Your task is to:
 
 How does the model perform on the independent test cohort?
 
-```{r}
+> To apply the model to an independent test cohort, we first need to retrain it on 100% of the training data in Cohort 1 (C1) — without cross-validation — so that the model has learned from all available training samples before making predictions. The test cohort (Supplementary Table 4, C2) contains 10 patients (4 Severe and 6 Non-severe) with their own proteomic profiles. We align features between the two cohorts, impute any missing proteins, and evaluate performance using a confusion matrix, accuracy, and AUC.
+
+```{r, comment=""}
 
 #We repeat the same training as in exercise one, but this time we train the model on 100% of the data in C1 (we skip the cross-validation)
 
@@ -791,14 +792,14 @@ plot(roc_obj, main = "True Test Cohort ROC: Severe vs non_Severe", col = "blue",
 ```
 
 
-Overall, model seems to predict quite well. Accuracy is low (60%) but we should keep some caveats in mind. Unlike the original we only used proteins. Furthermore, training data had 753 features after filtering, but test data has 742 (model cannot use some learnt proteins). N is just 10, even one or two random mismatches shifts accuracy 10 or 20%. AUC is quite good at 0.79, meaning model actually gives Severe patients a higher "risk" than non-severe 79% of the time. If we look at the confusion matrix, we see the model actually produced more false positives than false negatives. Meaning, the model currently overestimates severity. We chose an arbitrary, standard 50% cut-off. Raising it a little, could perhaps lower false positives withouth impacting false negatives. In fact, we found out there is a way to mathematically derive the optimal threshold from the ROC curve. In R:
+> **Results:** Overall, the model predicts quite well. Accuracy is low (60%) but several caveats apply. Unlike the original, we only used proteins. The training data had 753 features after filtering, but the test data has 742 — meaning the model cannot use some learned proteins. N is just 10, so even one or two random mismatches shifts accuracy by 10–20%. AUC is quite good at 0.79, meaning the model gives severe patients a higher "risk" than non-severe 79% of the time. Looking at the confusion matrix, the model produced more false positives than false negatives — meaning it currently overestimates severity. We chose an arbitrary standard 50% cut-off; raising it slightly could lower false positives without impacting false negatives. In fact, there is a way to mathematically derive the optimal threshold from the ROC curve:
 
-```{r}
+```{r, comment=""}
 # Find the mathematical optimal threshold from the ROC curve
 coords(roc_obj, "best", ret = c("threshold", "accuracy", "sensitivity", "specificity"))
 ```
 
- This tells us that that in this particular test cohort, 0.62 would actually be the optimal threshold. In real ML research this can be done during training, to try an identify a non arbitrary yet generalizable threshold.
+> This tells us that in this particular test cohort, 0.62 would actually be the optimal threshold. In real ML research this can be done during training to identify a non-arbitrary yet generalizable threshold.
  
  
 # session info {.unnumbered}
