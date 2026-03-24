@@ -27,20 +27,435 @@ Report the following performance metrics from cross-validation:
 How well does the Random Forest model separate non-Severe from Severe patients based on proteomic profiles?
 
 ```{r}
+# ==========================================
+# CHUNK 1: Data Import
+# ==========================================
+if (!requireNamespace("readxl", quietly = TRUE)) {
+  install.packages("readxl")
+}
+library(readxl)
 
+# Automatically set working directory to the script's location (requires RStudio)
+if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+  setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+}
+
+# Import proteomics data
+df <- read_excel("mmc3.xlsx", sheet = "Prot_and_meta_matrix", col_names = FALSE)
+
+# KEEP ONLY PROTEINS: Subset to rows 1 through 793 (metabolites start at 794)
+df <- df[1:793, ]
+
+# Drop column 2
+df <- df[, -2]
+
+# Move cell (1,1) to (2,1), remove row 1, set new row 1 as colnames, then remove it
+df[2, 1] <- df[1, 1]
+df <- df[-1, ]
+colnames(df) <- as.character(df[1, ])
+df <- df[-1, ]
+
+
+# ==========================================
+# CHUNK 2: Filtering (NO GLOBAL IMPUTATION)
+# ==========================================
+# To prevent data leakage, we ONLY perform basic missingness filtering here.
+# Imputation and scaling are deferred to the CV resampling loop in Chunk 4.
+
+# Convert patient columns to numeric
+df[, -1] <- lapply(df[, -1], as.numeric)
+
+# 1. Filter rows (Proteins/Metabolites) with > 20% missing values
+row_missing_frac <- rowMeans(is.na(df[, -1]))
+df <- df[row_missing_frac <= 0.20, ]
+
+# 2. Filter columns (Patients) with > 20% missing values
+col_missing_frac <- colMeans(is.na(df[, -1]))
+df <- df[, c(TRUE, col_missing_frac <= 0.20)]
+
+
+# ==========================================
+# CHUNK 3: Import Metadata and Map to Proteomics Data
+# ==========================================
+# 1. Import the metadata file
+labels_raw <- read_excel("data.xlsx", sheet = "Clinical_information")
+
+# 2. Extract Column 1 (Patient IDs) and Column 5 (Severity scores)
+meta_labels <- labels_raw[, c(1, 5)]
+
+# Rename columns to make them easier to work with
+colnames(meta_labels) <- c("PatientID", "Severity")
+meta_labels$Severity <- as.numeric(meta_labels$Severity)
+
+# 3. Filter rows: Keep only values 2 and 3
+meta_labels <- meta_labels[meta_labels$Severity %in% c(2, 3), ]
+
+# 4. Recode 2 as "non-Severe" and 3 as "Severe"
+meta_labels$Severity <- ifelse(meta_labels$Severity == 2, "non-Severe", "Severe")
+
+# 5. Map labels to the proteomics dataframe (df)
+# Get the patient IDs currently in our proteomics dataframe (excluding column 1)
+df_patients <- colnames(df)[-1]
+
+# Find the intersection (patients that exist in BOTH 'df' and 'meta_labels')
+common_patients <- intersect(df_patients, meta_labels$PatientID)
+
+# Filter 'meta_labels' to only include the common patients
+meta_labels <- meta_labels[meta_labels$PatientID %in% common_patients, ]
+
+# Filter 'df' to keep the first column ("Protein/Metabolites") AND the common patients
+df <- df[, c(colnames(df)[1], common_patients)]
+
+# Print a quick check
+cat("Number of matched patients:", length(common_patients), "\n")
+head(meta_labels)
+
+
+# ==========================================
+# CHUNK 4: Random Forest Modeling & Evaluation
+# ==========================================
+# Install and load required packages
+if (!requireNamespace("caret", quietly = TRUE)) install.packages("caret")
+if (!requireNamespace("randomForest", quietly = TRUE)) install.packages("randomForest")
+if (!requireNamespace("pROC", quietly = TRUE)) install.packages("pROC")
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+if (!requireNamespace("doParallel", quietly = TRUE)) install.packages("doParallel")
+
+# Add Bioconductor packages for ID mapping
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+if (!requireNamespace("AnnotationDbi", quietly = TRUE)) BiocManager::install("AnnotationDbi", update = FALSE)
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE)) BiocManager::install("org.Hs.eg.db", update = FALSE)
+
+library(caret)
+library(randomForest)
+library(pROC)
+library(ggplot2)
+library(doParallel)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+
+# 1. Prepare data for modeling (Transpose and Map IDs)
+original_features <- as.character(df[[1]])
+
+# Attempt to map UniProt IDs to HGNC Symbols
+# (Metabolites and unmapped proteins will safely return NA)
+suppressMessages({
+  mapped_symbols <- mapIds(
+    org.Hs.eg.db,
+    keys = original_features,
+    column = "SYMBOL",
+    keytype = "UNIPROT",
+    multiVals = "first"
+  )
+})
+
+# Replace with HGNC symbol if a mapping was found, otherwise keep original name
+updated_features <- ifelse(is.na(mapped_symbols), original_features, mapped_symbols)
+
+# R models require valid column names without spaces or special characters
+valid_protein_names <- make.names(updated_features, unique = TRUE)
+
+# Transpose dataframe (exclude the first column of IDs)
+df_t <- as.data.frame(t(df[, -1]))
+colnames(df_t) <- valid_protein_names
+
+# Add PatientID back in for merging
+df_t$PatientID <- rownames(df_t)
+
+# 2. Merge labels and transposed proteomics data
+# Set explicitly to factors with "Severe" as the first level (the positive class)
+meta_labels$Severity <- factor(gsub("-", "_", meta_labels$Severity), levels = c("Severe", "non_Severe"))
+model_data <- merge(meta_labels, df_t, by = "PatientID")
+
+# Drop the PatientID column as it shouldn't be used as a predictor feature
+model_data$PatientID <- NULL
+
+
+# 3. Set up Parallel Processing (Allocate 6 Cores)
+cat("\nSetting up parallel processing with 6 cores...\n")
+cl <- makePSOCKcluster(6)
+registerDoParallel(cl)
+
+# 4. Set up 5-Fold Cross-Validation Repeated 20 Times (Reduced from 100 for speed)
+set.seed(123) 
+# Explicitly namespace trainControl to caret
+fitControl <- caret::trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 20,                        # Reduced from 100 for faster computation
+  classProbs = TRUE,                   # Needed for ROC/AUC
+  summaryFunction = twoClassSummary,   # Calculates ROC, Sensitivity, Specificity
+  savePredictions = "final",           # Keep CV predictions for final probability aggregation
+  allowParallel = TRUE                 # Enable parallel processing for caret
+)
+
+# 5. Train the Final Random Forest Model (Leakage-Free)
+# preProcess = c("medianImpute", "center", "scale") ensures that imputation and 
+# scaling are computed ONLY on the 4 training folds and applied to the 1 holdout fold.
+cat("\nTraining repeated CV Random Forest (Running in parallel)...\n")
+
+# Explicitly namespace train to caret to avoid S3 dispatch conflicts
+rf_fit <- caret::train(
+  Severity ~ .,
+  data = model_data,
+  method = "rf",
+  trControl = fitControl,
+  preProcess = c("medianImpute", "center", "scale"),
+  metric = "ROC",
+  ntree = 500,                         # Reduced from 1000 for faster computation
+  importance = TRUE,
+  na.action = na.pass                  # Crucial: allows NAs to pass to preProcess
+)
+
+# Stop the parallel cluster after training is complete
+stopCluster(cl)
+registerDoSEQ()
+cat("\nModel training complete. Parallel cluster stopped.\n")
+
+# 6. Report Performance Metrics & Plots
+
+# === Calculate Normalized Additive Predicting Probability ===
+# Average the predicted probabilities for each patient across all cross-validation repeats
+cv_predictions <- aggregate(cbind(Severe, non_Severe) ~ rowIndex, data = rf_fit$pred, FUN = mean)
+# Re-attach the true observations based on row index
+cv_predictions$obs <- rf_fit$pred$obs[match(cv_predictions$rowIndex, rf_fit$pred$rowIndex)]
+# Determine final prediction based on the averaged probabilities (explicitly keeping "Severe" as level 1)
+cv_predictions$pred <- factor(ifelse(cv_predictions$Severe > 0.5, "Severe", "non_Severe"), levels = c("Severe", "non_Severe"))
+
+# === Confusion Matrix and Accuracy ===
+cat("\n=== Confusion Matrix & Accuracy ===\n")
+# Explicitly telling caret that "Severe" is the positive class and namespacing to caret
+conf_mat <- caret::confusionMatrix(cv_predictions$pred, cv_predictions$obs, positive = "Severe")
+print(conf_mat)
+
+# Plot 1: Visual Confusion Matrix (Square Heatmap)
+cm_df <- as.data.frame(conf_mat$table)
+cm_plot <- ggplot(data = cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white", linewidth = 1) +
+  geom_text(aes(label = Freq), size = 8, color = "black") +
+  scale_fill_gradient(low = "#f7f7f7", high = "#6baed6") +
+  theme_minimal() +
+  labs(title = "Confusion Matrix: Severe vs non_Severe",
+       x = "Actual Severity",
+       y = "Predicted Severity") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+        axis.title = element_text(face = "bold"),
+        legend.position = "none") # Hide the legend since the numbers are explicitly printed
+print(cm_plot)
+
+# === ROC Curve and AUC ===
+cat("\n=== ROC Curve and AUC ===\n")
+# Calculate ROC using the probabilities of the 'Severe' class
+roc_obj <- roc(response = cv_predictions$obs, 
+               predictor = cv_predictions$Severe,
+               levels = rev(levels(cv_predictions$obs)))
+
+cat("Area under the curve (AUC):", round(auc(roc_obj), 4), "\n")
+
+# Plot 2: ROC Curve
+plot(roc_obj, 
+     main = "ROC Curve: Severe vs non_Severe COVID-19", 
+     col = "darkred", 
+     lwd = 2, 
+     legacy.axes = TRUE,
+     print.auc = TRUE,
+     print.auc.y = 0.2)
+
+# === Additional Model Diagnostics ===
+cat("\n=== Model Tuning & Variable Importance ===\n")
+
+# Plot 3: Cross-validation performance across tuning parameters (mtry)
+plot(rf_fit, main = "Random Forest CV Performance (mtry tuning)")
+
+# Plot 4: Top 29 Variable Importance
+# Shows which proteins/metabolites were most critical for the classification
+var_imp <- caret::varImp(rf_fit, scale = FALSE)
+plot(var_imp, top = 29, main = "Top 29 Most Important Proteins", xlab = "Mean Decrease in Accuracy")
 ```
+MAIN CLARIFICATION: In the paper the RF was trained both with proteins and metabolites. Yet task specifically said "based on proteomic data", so we excluded metabolites from the data. This can cause major differences in the models.
+
+
+Caveats:
+1. We use different data cleaning and imputation than in the paper.
+2. We used median imputation rather than the methods used in the paper.
+3. We imputed and scaled in each data split rather than globally to prevent data leakage, the paper does not explicitly state this.
+4. We had to reduce certain RF parameters to keep the running time reasonable with our limit of 6 CPUs.
+
+Results:
+
+Confusion Matrix: four False negatives and two false positives against the one false positive on the paper.
+Accuracy: 0.8065 against the 0.935 of the original paper. Lower than the original, but acceptable as a score.
+mTRY: Rather smooth drop, this is good, means model is not only relying on a few strong features, but is actually learning a general pattern.
+AUC/ROC: AUC is 0.9103 against 0.957 of the original paper. Lower than the original, but falls in the same relative range. Basically means, if we draw a random severe patient with a random non-severe, the model will give more "risk" to the severe patient 91% of the times. ROC rises sharply, thats also good. It means that as the decision threshold rises, sensitivity improves, yet specificity does not drop significantly. Model can differentiate groups quite well by allocating risk correctly.
+
+Conclusion: The deviations from the original could very well be justified with differences in imputation, data split and lower parameters. With this in mind, all metrics of our model are relatively high. The model appears to more or less balance negative and positive predictions, does not seem to overfit nor underfit, while accuracy, sensitivity and somewhat specificity report accurate predictions. We have to keep in mind that N is low (31), so even small deviations can have a high impact on metrics.
+
 
 # Exercise 2
 
 **Identify and interpret the most important features**
 
-Using the trained Random Forest model from Exercise 1, identify the 25 most important protein features contributing to the classification. Disccus their biological relevance.
+Using the trained Random Forest model from Exercise 1, identify the 25 most important protein features contributing to the classification. Disccuss their biological relevance.
 
 Compare your selected features to the proteins reported by the authors in Supplementary Table 5.
 
 ```{r}
+# 1. Install required packages for direct mapping
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+if (!requireNamespace("reactome.db", quietly = TRUE)) BiocManager::install("reactome.db", update = FALSE)
+if (!requireNamespace("reshape2", quietly = TRUE)) install.packages("reshape2")
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+
+library(reactome.db)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(reshape2)
+
+cat("\n=== Extracting Top 25 Proteins ===\n")
+
+# 2. Extract Top 25 PROTEIN Features
+imp_df <- caret::varImp(rf_fit, scale = FALSE)$importance
+imp_df$R_Name <- rownames(imp_df)
+
+feature_map <- data.frame(
+  R_Name = valid_protein_names,
+  Symbol = mapped_symbols,      
+  Original_ID = original_features
+)
+
+imp_mapped <- merge(imp_df, feature_map, by = "R_Name")
+imp_mapped <- imp_mapped[order(-imp_mapped[, 2]), ] 
+imp_proteins_only <- imp_mapped[!is.na(imp_mapped$Symbol), ]
+
+# Get the Top 25 Symbols
+top25_symbols <- imp_proteins_only$Symbol[1:25]
+
+# 3. Map Symbols to Entrez IDs (Reactome uses Entrez)
+entrez_mapping <- mapIds(org.Hs.eg.db, keys = top25_symbols, column = "ENTREZID", keytype = "SYMBOL", multiVals = "first")
+# Create a dataframe to keep track of Symbol to Entrez relationship
+mapping_df <- data.frame(
+  Symbol = names(entrez_mapping),
+  Entrez = unname(entrez_mapping),
+  stringsAsFactors = FALSE
+)
+mapping_df <- mapping_df[!is.na(mapping_df$Entrez), ]
+
+# 4. Direct 1:1 Query to Reactome Database
+cat("\nQuerying Reactome Database directly...\n")
+pathway_data <- suppressMessages(
+  AnnotationDbi::select(
+    reactome.db, 
+    keys = mapping_df$Entrez, 
+    columns = "PATHNAME", 
+    keytype = "ENTREZID"
+  )
+)
+
+# Clean up the Reactome pathway names (Remove the "Homo sapiens: " prefix)
+pathway_data$PATHNAME <- gsub("^Homo sapiens: ", "", pathway_data$PATHNAME)
+
+# Merge back the Gene Symbols for readability
+pathway_data <- merge(pathway_data, mapping_df, by.x = "ENTREZID", by.y = "Entrez")
+
+# ==========================================
+# 5. Filter for the Most Relevant Pathways & FORCE ALL 25 GENES
+# ==========================================
+pathway_counts <- sort(table(pathway_data$PATHNAME), decreasing = TRUE)
+top_pathways <- names(pathway_counts)[1:10] 
+
+# Filter our data to only include these top pathways
+plot_data <- pathway_data[pathway_data$PATHNAME %in% top_pathways, ]
+
+# FIX 1: Explicitly turn the Symbol column into a factor that contains ALL 25 original genes
+plot_data$Symbol <- factor(plot_data$Symbol, levels = top25_symbols)
+
+# Wrap long pathway names so they don't get cut off on the y-axis
+plot_data$PATHNAME_wrapped <- sapply(plot_data$PATHNAME, function(x) {
+  paste(strwrap(x, width = 45), collapse = "\n")
+})
+
+# Order the pathways by prominence
+wrapped_counts <- sort(table(plot_data$PATHNAME_wrapped), decreasing = FALSE)
+plot_data$PATHNAME_wrapped <- factor(plot_data$PATHNAME_wrapped, levels = names(wrapped_counts))
+
+
+# ==========================================
+# 6. Plotting and Exporting the Gene-to-Pathway Map
+# ==========================================
+cat("\nGenerating Direct Pathway Map...\n")
+
+p_map <- ggplot(plot_data, aes(x = Symbol, y = PATHNAME_wrapped, fill = PATHNAME_wrapped)) +
+  geom_tile(color = "white", size = 0.5) +
+  theme_minimal() +
+  # FIX 2: scale_x_discrete(drop = FALSE) forces ggplot to show all 25 genes, even empty ones!
+  scale_x_discrete(drop = FALSE) + 
+  labs(
+    title = "Direct 1:1 Mapping: Top 25 Proteins to Reactome Pathways",
+    x = "Protein (Gene Symbol)",
+    y = "Reactome Pathway"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold"),
+    axis.text.y = element_text(size = 9, face = "bold"),
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    # Extra bottom margin to ensure X-axis text fits
+    plot.margin = ggplot2::margin(t = 20, r = 20, b = 30, l = 10), 
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, size = 1),
+    legend.position = "none"
+  )
+
+print(p_map)
+
+# FIX 3: Save a perfectly sized, uncropped PNG to your working directory
+ggsave("Top25_Reactome_Map.png", plot = p_map, width = 12, height = 8, dpi = 300)
+cat("\nPlot saved successfully as 'Top25_Reactome_Map.png' in your working directory!\n")
+# 1. Load the paper's protein list from mmc5.xlsx
+# We use the 'range' argument to strictly grab columns A and B, rows 3 to 24
+paper_data <- readxl::read_excel(
+  "mmc5.xlsx", 
+  sheet = "Prot_and_meta_matrix",
+  range = "A3:B24", 
+  col_names = c("Uniprot_ID", "HGNC_Symbol")
+)
+
+cat("\n=== Comparing Top 25 Proteins to Paper's Supplementary Table 5 ===\n")
+
+# 2. Extract and clean the paper's HGNC symbols
+paper_symbols <- na.omit(paper_data$HGNC_Symbol)
+paper_symbols <- unique(as.character(paper_symbols))
+
+# 3. Find the overlap with our model's Top 25 proteins
+# (top25_symbols was created and saved in Chunk 5)
+overlapping_proteins <- intersect(top25_symbols, paper_symbols)
+num_overlap <- length(overlapping_proteins)
+
+# 4. Print the comparison results
+cat(sprintf("Number of overlapping proteins: %d out of the %d reported in the paper\n\n", 
+            num_overlap, length(paper_symbols)))
+
+cat("The overlapping proteins are:\n")
+print(overlapping_proteins)
+
+# Let's also see what the paper found that our top 25 missed
+missed_by_us <- setdiff(paper_symbols, top25_symbols)
+cat("\nProteins highlighted by the paper but NOT in our Top 25:\n")
+print(missed_by_us)
+
+# And what our model prioritized that the paper didn't include in their strict list
+extra_in_ours <- setdiff(top25_symbols, paper_symbols)
+cat("\nProteins in our Top 25 but NOT in the paper's main list:\n")
+print(extra_in_ours)
+
 
 ```
+
+
+Biological interpretations: Most of our detected genes are involved in immune responses. This matches what we would expect given our case (COVID is an infection, which is nowadays also known to directly influence the immune system beyond a standard immune activation). We see a lot of protein control pathways (like metabolism and post-translational modification), this is also common during increased cell activity (like a viral infection, or for example, the immune system cleaning extra cellular debris). Similar to the study, we also see Platelet degranutalion among our top 25 proteins. Overall, our model seems to differentiate non-severe from severe based on the expression of proteins directly or indirectly related to immune response and cell state (Homeostasis), as well as wound response (Platelets). 
+
+Comparison to the study: Not very similar 6 out of 25 proteins match but the general pathways present seem more similar. Both models differentiate based on immune response proteins expression. Both models highlighted SERPINA family members, a family key in regulating cell homestasis and programmed death (a key defense mechanism in viral infections). Differences could be explained by several factors, but mostly: As mentioned before, we used different parameters for data cleaning and imputation. Moreover, our model was trained on Cohort 1 (C1), while their highlighted proteins in S5 were derived from C3 (if the ML is generalizable this shouldn't cause major deviations, but can explain differences.) Our RF was also kept less computationally intensive for the sake of running speed, which resulted in a slightly less accurate model even if acceptable. With this in mind, differences seem to be in the details rather than the overall signal. Both models splits based on immune response protein expression, both models largely splitted groups correctly, both models identified as the strongest features proteins involved in the same or similar/related pathways. Overall, we are confident this is just a difference in resolution and context, not a major shift from the original, even though our model was not trained with metabolites, only proteins.
+
 
 # Exercise 3
 
@@ -60,8 +475,332 @@ How does the model perform on the independent test cohort?
 
 ```{r}
 
+#We repeat the same training as in exercise one, but this time we train the model on 100% of the data in C1 (we skip the cross-validation)
+
+# ==========================================
+# CHUNK 1: Data Import
+# ==========================================
+if (!requireNamespace("readxl", quietly = TRUE)) {
+  install.packages("readxl")
+}
+library(readxl)
+
+# Automatically set working directory to the script's location (requires RStudio)
+if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+  setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+}
+
+# Import proteomics data
+df <- read_excel("mmc3.xlsx", sheet = "Prot_and_meta_matrix", col_names = FALSE)
+
+# KEEP ONLY PROTEINS: Subset to rows 1 through 793 (metabolites start at 794)
+df <- df[1:793, ]
+
+# Drop column 2
+df <- df[, -2]
+
+# Move cell (1,1) to (2,1), remove row 1, set new row 1 as colnames, then remove it
+df[2, 1] <- df[1, 1]
+df <- df[-1, ]
+colnames(df) <- as.character(df[1, ])
+df <- df[-1, ]
+
+
+# ==========================================
+# CHUNK 2: Filtering (NO GLOBAL IMPUTATION)
+# ==========================================
+# To prevent data leakage, we ONLY perform basic missingness filtering here.
+# Imputation and scaling are deferred to the CV resampling loop in Chunk 4.
+
+# Convert patient columns to numeric
+df[, -1] <- lapply(df[, -1], as.numeric)
+
+# 1. Filter rows (Proteins/Metabolites) with > 20% missing values
+row_missing_frac <- rowMeans(is.na(df[, -1]))
+df <- df[row_missing_frac <= 0.20, ]
+
+# 2. Filter columns (Patients) with > 20% missing values
+col_missing_frac <- colMeans(is.na(df[, -1]))
+df <- df[, c(TRUE, col_missing_frac <= 0.20)]
+
+
+# ==========================================
+# CHUNK 3: Import Metadata and Map to Proteomics Data
+# ==========================================
+# 1. Import the metadata file
+labels_raw <- read_excel("data.xlsx", sheet = "Clinical_information")
+
+# 2. Extract Column 1 (Patient IDs) and Column 5 (Severity scores)
+meta_labels <- labels_raw[, c(1, 5)]
+
+# Rename columns to make them easier to work with
+colnames(meta_labels) <- c("PatientID", "Severity")
+meta_labels$Severity <- as.numeric(meta_labels$Severity)
+
+# 3. Filter rows: Keep only values 2 and 3
+meta_labels <- meta_labels[meta_labels$Severity %in% c(2, 3), ]
+
+# 4. Recode 2 as "non-Severe" and 3 as "Severe"
+meta_labels$Severity <- ifelse(meta_labels$Severity == 2, "non-Severe", "Severe")
+
+# 5. Map labels to the proteomics dataframe (df)
+# Get the patient IDs currently in our proteomics dataframe (excluding column 1)
+df_patients <- colnames(df)[-1]
+
+# Find the intersection (patients that exist in BOTH 'df' and 'meta_labels')
+common_patients <- intersect(df_patients, meta_labels$PatientID)
+
+# Filter 'meta_labels' to only include the common patients
+meta_labels <- meta_labels[meta_labels$PatientID %in% common_patients, ]
+
+# Filter 'df' to keep the first column ("Protein/Metabolites") AND the common patients
+df <- df[, c(colnames(df)[1], common_patients)]
+
+# Print a quick check
+cat("Number of matched patients:", length(common_patients), "\n")
+head(meta_labels)
+
+
+# ==========================================
+# CHUNK 4: Random Forest Modeling (Full Data)
+# ==========================================
+
+# Install and load required packages
+if (!requireNamespace("caret", quietly = TRUE)) install.packages("caret")
+if (!requireNamespace("randomForest", quietly = TRUE)) install.packages("randomForest")
+if (!requireNamespace("pROC", quietly = TRUE)) install.packages("pROC")
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+if (!requireNamespace("doParallel", quietly = TRUE)) install.packages("doParallel")
+
+# Add Bioconductor packages for ID mapping
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+if (!requireNamespace("AnnotationDbi", quietly = TRUE)) BiocManager::install("AnnotationDbi", update = FALSE)
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE)) BiocManager::install("org.Hs.eg.db", update = FALSE)
+
+library(caret)
+library(randomForest)
+library(pROC)
+library(ggplot2)
+library(doParallel)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+
+# 1. Prepare data for modeling (Transpose and Map IDs)
+original_features <- as.character(df[[1]])
+
+# Attempt to map UniProt IDs to HGNC Symbols
+suppressMessages({
+  mapped_symbols <- mapIds(
+    org.Hs.eg.db,
+    keys = original_features,
+    column = "SYMBOL",
+    keytype = "UNIPROT",
+    multiVals = "first"
+  )
+})
+
+# Replace with HGNC symbol if a mapping was found, otherwise keep original name
+updated_features <- ifelse(is.na(mapped_symbols), original_features, mapped_symbols)
+
+# R models require valid column names without spaces or special characters
+valid_protein_names <- make.names(updated_features, unique = TRUE)
+
+# Transpose dataframe (exclude the first column of IDs)
+df_t <- as.data.frame(t(df[, -1]))
+colnames(df_t) <- valid_protein_names
+
+# Add PatientID back in for merging
+df_t$PatientID <- rownames(df_t)
+
+# 2. Merge labels and transposed proteomics data
+# Set explicitly to factors with "Severe" as the first level (the positive class)
+meta_labels$Severity <- factor(gsub("-", "_", meta_labels$Severity), levels = c("Severe", "non_Severe"))
+model_data <- merge(meta_labels, df_t, by = "PatientID")
+
+# Drop the PatientID column as it shouldn't be used as a predictor feature
+model_data$PatientID <- NULL
+
+
+# 3. Set up Parallel Processing (Allocate 6 Cores)
+cat("\nSetting up parallel processing with 6 cores...\n")
+cl <- makePSOCKcluster(6)
+registerDoParallel(cl)
+
+# 4. Set up Training Control for Full Data (method = "none")
+set.seed(123) 
+fitControl <- caret::trainControl(
+  method = "none",                     # Instructs caret to use all data and skip resampling
+  classProbs = TRUE,                   # Keep to predict probabilities later
+  allowParallel = TRUE                 # Enable parallel processing
+)
+
+# Because we aren't resampling, we must explicitly define the tuning parameter 'mtry'.
+# The standard default for classification is the square root of the number of predictors.
+num_predictors <- ncol(model_data) - 1
+mtry_val <- floor(sqrt(num_predictors))
+rf_grid <- data.frame(mtry = mtry_val)
+
+# 5. Train the Final Random Forest Model on 100% of the Data
+cat("\nTraining Random Forest on the entire dataset (Running in parallel)...\n")
+
+rf_fit <- caret::train(
+  Severity ~ .,
+  data = model_data,
+  method = "rf",
+  trControl = fitControl,
+  tuneGrid = rf_grid,                                 # Must provide exact tuning grid when method="none"
+  preProcess = c("medianImpute", "center", "scale"),  # Applied globally to the whole dataset now
+  ntree = 1000,
+  importance = TRUE,
+  na.action = na.pass                                 # Allows NAs to pass to preProcess
+)
+
+# Stop the parallel cluster after training is complete
+stopCluster(cl)
+registerDoSEQ()
+cat("\nModel training complete. Parallel cluster stopped.\n")
+
+# ==========================================
+# CHUNK 5: Test Cohort Import
+# ==========================================
+cat("\nImporting test cohort (mmc4.xlsx)...\n")
+df_test <- read_excel("mmc4.xlsx", sheet = "Prot_and_meta_matrix", col_names = FALSE)
+
+# Keep ONLY up to row 744 (Proteins only, discarding metabolites below)
+df_test <- df_test[1:744, ]
+
+# Drop column 2
+df_test <- df_test[, -2]
+
+# Format headers exactly like the training data
+df_test[2, 1] <- df_test[1, 1]
+df_test <- df_test[-1, ]
+colnames(df_test) <- as.character(df_test[1, ])
+df_test <- df_test[-1, ]
+
+# Convert patient columns to numeric
+df_test[, -1] <- lapply(df_test[, -1], as.numeric)
+
+# ==========================================
+# CHUNK 6: Map Test Patients to Metadata
+# ==========================================
+# We must re-import the metadata because we previously filtered it down to only training patients
+labels_raw_test <- read_excel("data.xlsx", sheet = "Clinical_information")
+
+meta_test <- labels_raw_test[, c(1, 5)]
+colnames(meta_test) <- c("PatientID", "Severity")
+
+# FIX: Safely convert to character instead of numeric to prevent NAs
+meta_test$Severity <- as.character(meta_test$Severity)
+
+# Standardize all possible labels (numbers or text) to exactly "Severe" and "non_Severe"
+meta_test$Severity[meta_test$Severity == "2"] <- "non_Severe"
+meta_test$Severity[meta_test$Severity == "3"] <- "Severe"
+meta_test$Severity[meta_test$Severity == "non-Severe"] <- "non_Severe" # In case of hyphens
+
+# Filter to keep ONLY our two valid classes
+meta_test <- meta_test[meta_test$Severity %in% c("Severe", "non_Severe"), ]
+meta_test$Severity <- factor(meta_test$Severity, levels = c("Severe", "non_Severe"))
+
+# Find the intersection for the TEST cohort
+test_patients <- colnames(df_test)[-1]
+common_test_patients <- intersect(test_patients, meta_test$PatientID)
+
+# Filter
+meta_test <- meta_test[meta_test$PatientID %in% common_test_patients, ]
+df_test <- df_test[, c(colnames(df_test)[1], common_test_patients)]
+
+cat("Number of matched TEST patients:", length(common_test_patients), "\n")
+
+# ==========================================
+# CHUNK 7: Test Prediction & Evaluation
+# ==========================================
+# 1. Map IDs to HGNC Symbols (Same as Training)
+original_features_test <- as.character(df_test[[1]])
+
+suppressMessages({
+  mapped_symbols_test <- mapIds(
+    org.Hs.eg.db,
+    keys = original_features_test,
+    column = "SYMBOL",
+    keytype = "UNIPROT",
+    multiVals = "first"
+  )
+})
+
+updated_features_test <- ifelse(is.na(mapped_symbols_test), original_features_test, mapped_symbols_test)
+valid_protein_names_test <- make.names(updated_features_test, unique = TRUE)
+
+# Transpose
+df_test_t <- as.data.frame(t(df_test[, -1]))
+colnames(df_test_t) <- valid_protein_names_test
+df_test_t$PatientID <- rownames(df_test_t)
+
+# Merge labels
+test_data <- merge(meta_test, df_test_t, by = "PatientID")
+
+# Keep a record of the IDs, then drop from predictors
+test_patient_ids <- test_data$PatientID
+test_data$PatientID <- NULL
+
+# 2. ALIGN FEATURES (Crucial Step - WITH FIX APPLIED)
+# The test data is missing metabolites and possibly some proteins that didn't map. 
+# We must add these missing columns as NAs so caret can impute them based on training medians.
+train_features <- rf_fit$coefnames
+missing_features <- setdiff(train_features, colnames(test_data))
+
+if (length(missing_features) > 0) {
+  # FIX: Use NA_real_ so the new columns are created as numeric, not logical
+  test_data[missing_features] <- NA_real_
+  cat("\nAdded", length(missing_features), "missing features as NAs to test data for imputation.\n")
+}
+
+# FIX: Force all predictor columns to be explicitly numeric
+# (Transposing a dataframe can sometimes secretly turn numbers into characters)
+predictor_cols <- setdiff(colnames(test_data), "Severity")
+test_data[predictor_cols] <- lapply(test_data[predictor_cols], as.numeric)
+
+# 3. GENERATE PREDICTIONS
+cat("\nApplying trained model to the test cohort...\n")
+
+# Get Predicted Probabilities (Crucial: na.action = na.pass stops it from deleting NA rows)
+test_probs <- predict(rf_fit, newdata = test_data, type = "prob", na.action = na.pass)
+
+# Get Predicted Class Labels (Threshold = 0.5)
+test_preds <- predict(rf_fit, newdata = test_data, na.action = na.pass)
+
+# Create a clean dataframe showing individual patient results
+patient_results <- data.frame(
+  PatientID = test_patient_ids,
+  True_Label = test_data$Severity,
+  Predicted_Label = test_preds,
+  Prob_Severe = test_probs$Severe
+)
+
+# 4. EVALUATE PERFORMANCE
+cat("\n--- Independent Test Cohort Confusion Matrix ---\n")
+conf_matrix <- confusionMatrix(data = test_preds, reference = test_data$Severity, positive = "Severe")
+print(conf_matrix)
+
+# Calculate and print Area Under the Curve (AUC) - FIXED DIRECTION
+roc_obj <- suppressMessages(roc(test_data$Severity, test_probs$Severe, levels = c("non_Severe", "Severe")))
+cat("\nTrue Test Cohort AUC:", auc(roc_obj), "\n")
+
+# Plot the real ROC curve
+plot(roc_obj, main = "True Test Cohort ROC: Severe vs non_Severe", col = "blue", lwd = 2, legacy.axes = TRUE, print.auc = TRUE)
 ```
 
+
+Overall, model seems to predict quite well. Accuracy is low (60%) but we should keep some caveats in mind. Unlike the original we only used proteins. Furthermore, training data had 753 features after filtering, but test data has 742 (model cannot use some learnt proteins). N is just 10, even one or two random mismatches shifts accuracy 10 or 20%. AUC is quite good at 0.79, meaning model actually gives Severe patients a higher "risk" than non-severe 79% of the time. If we look at the confusion matrix, we see the model actually produced more false positives than false negatives. Meaning, the model currently overestimates severity. We chose an arbitrary, standard 50% cut-off. Raising it a little, could perhaps lower false positives withouth impacting false negatives. In fact, we found out there is a way to mathematically derive the optimal threshold from the ROC curve. In R:
+
+```{r}
+# Find the mathematical optimal threshold from the ROC curve
+coords(roc_obj, "best", ret = c("threshold", "accuracy", "sensitivity", "specificity"))
+```
+
+ This tells us that that in this particular test cohort, 0.62 would actually be the optimal threshold. In real ML research this can be done during training, to try an identify a non arbitrary yet generalizable threshold.
+ 
+ 
 # session info {.unnumbered}
 
 ```{r, results='asis',  echo=FALSE, message=FALSE }
